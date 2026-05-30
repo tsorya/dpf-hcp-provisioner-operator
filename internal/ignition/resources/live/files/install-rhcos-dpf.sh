@@ -137,26 +137,41 @@ install_rhcos() {
         esac
     done
 
-    coreos-installer install "$TARGET_DEVICE" \
-        --append-karg "$KERNEL_PARAMETERS" \
-        --ignition-file "$IGNITION_FILE" \
-        --offline
+    # coreos-installer can transiently fail, retry up to 3 times
+    for attempt in 1 2 3; do
+        if coreos-installer install "$TARGET_DEVICE" \
+            --append-karg "$KERNEL_PARAMETERS" \
+            --ignition-file "$IGNITION_FILE" \
+            --offline; then
+            return 0
+        fi
+        log "WARN: coreos-installer failed (attempt $attempt/3), retrying in 30s..."
+        sleep 30
+    done
 
-    if [ $? -ne 0 ]; then
-        error "RHCOSInstallation" "Failed to install Red Hat CoreOS."
-        exit 1
-    fi
+    error "RHCOSInstallation" "Failed to install Red Hat CoreOS after 3 attempts."
+    exit 1
 }
 
-wait_for_host_reboot_if_required() {
-    if [ "$NVCONFIG_CHANGED" = "true" ]; then
-        log "INFO: Host reboot required (NVConfig was changed), signaling host agent"
-        dpu_agent update-host-reboot
+request_host_power_cycle() {
+    log "INFO: Host power cycle required (NVConfig was changed), requesting from host agent"
+    dpu_agent update-time || true
+    while true; do
+        log "INFO: Requesting host power cycle..."
+        dpu_agent request-host-power-cycle || true
+        sleep 60
+    done
+}
+
+reboot_or_power_cycle() {
+    if [ "$NVCONFIG_CHANGED" != "true" ]; then
+        log "INFO: No host reboot required, rebooting DPU into RHCOS..."
         dpu_agent update-time
-        shutdown -h now
-        sleep infinity
+        sleep 10
+        reboot
     fi
-    log "INFO: No host reboot required."
+
+    request_host_power_cycle
 }
 
 validate_identity
@@ -172,11 +187,4 @@ sync
 
 log "INFO: Installation complete."
 
-dpu_agent update-time
-
-wait_for_host_reboot_if_required
-
-log "INFO: Waiting for 10 seconds before rebooting"
-sleep 10
-log "INFO: Rebooting..."
-reboot
+reboot_or_power_cycle

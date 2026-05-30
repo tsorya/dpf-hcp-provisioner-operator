@@ -38,12 +38,19 @@ def base_request(method, path, payload):
         sys.exit(1)
 
 
-def configure_host_vfs():
-    return base_request("POST", "/configure-host-vfs", {
+def opt_int_arg(index):
+    return int(sys.argv[index]) if len(sys.argv) > index else None
+
+
+def configure_host_vfs(vf_count=None):
+    payload = {
         "dpuName": DPU_NAME,
         "dpuNamespace": DPU_NAMESPACE,
         "dpuUID": DPU_UID,
-    })
+    }
+    if vf_count is not None:
+        payload["vfCount"] = vf_count
+    return base_request("POST", "/configure-host-vfs", payload)
 
 
 def update_reboot_method_discovery():
@@ -63,14 +70,21 @@ def update_reboot_method_discovery():
     })
 
 
-def update_host_reboot():
-    return base_request("POST", "/update-status", {
+def request_system_level_reset():
+    return base_request("POST", "/trigger-reboot", {
         "dpuName": DPU_NAME,
         "dpuNamespace": DPU_NAMESPACE,
         "dpuUID": DPU_UID,
-        "agentStatus": {
-            "rebootMethod": "SystemLevelReset"
-        },
+        "rebootMethod": "SystemLevelReset",
+    })
+
+
+def request_host_power_cycle():
+    return base_request("POST", "/trigger-reboot", {
+        "dpuName": DPU_NAME,
+        "dpuNamespace": DPU_NAMESPACE,
+        "dpuUID": DPU_UID,
+        "rebootMethod": "PowerCycle",
     })
 
 
@@ -122,9 +136,10 @@ def send_error(reason, message):
 
 
 COMMANDS = {
-    "configure-host-vfs": configure_host_vfs,
+    "configure-host-vfs": lambda: configure_host_vfs(opt_int_arg(2)),
     "update-reboot-method-discovery": update_reboot_method_discovery,
-    "update-host-reboot": update_host_reboot,
+    "request-system-level-reset": request_system_level_reset,
+    "request-host-power-cycle": request_host_power_cycle,
     "update-nvconfig-applied": update_nvconfig_applied,
     "update-time": update_time,
     "send-error": lambda: send_error(sys.argv[2], sys.argv[3]),
