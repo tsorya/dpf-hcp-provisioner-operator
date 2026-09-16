@@ -29,6 +29,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	dpuservicev1alpha1 "github.com/nvidia/doca-platform/api/dpuservice/v1alpha1"
 	provisioningv1alpha1 "github.com/rh-ecosystem-edge/dpf-hcp-provisioner-operator/api/v1alpha1"
 )
 
@@ -100,6 +101,37 @@ func setDPFOperatorConfigVersion(version string) {
 	config.Status.Version = ptr.To(version)
 	err = k8sClient.Status().Update(ctx, config)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to set DPFOperatorConfig version")
+}
+
+func defaultDPUServiceTemplates() map[string]dpuservicev1alpha1.DPUDeploymentServiceConfiguration {
+	return map[string]dpuservicev1alpha1.DPUDeploymentServiceConfiguration{
+		"ovn":                    {ServiceTemplate: "ovn", ServiceConfiguration: "ovn"},
+		"doca-telemetry-service": {ServiceTemplate: "doca-telemetry-service", ServiceConfiguration: "dts"},
+		"hbn":                    {ServiceTemplate: "hbn", ServiceConfiguration: "hbn"},
+	}
+}
+
+func customDPUServiceTemplates() map[string]dpuservicev1alpha1.DPUDeploymentServiceConfiguration {
+	return map[string]dpuservicev1alpha1.DPUDeploymentServiceConfiguration{
+		"ovn":                    {ServiceTemplate: "e2e-ovn", ServiceConfiguration: "ovn"},
+		"doca-telemetry-service": {ServiceTemplate: "e2e-dts", ServiceConfiguration: "dts"},
+		"hbn":                    {ServiceTemplate: "e2e-hbn", ServiceConfiguration: "hbn"},
+	}
+}
+
+// patchDPUDeploymentServices updates DPUDeployment.spec.services so the
+// template controller creates objects under the names the DPUDeployment points at.
+func patchDPUDeploymentServices(
+	ns, name string,
+	services map[string]dpuservicev1alpha1.DPUDeploymentServiceConfiguration,
+) {
+	ctx := context.Background()
+	dd := &dpuservicev1alpha1.DPUDeployment{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, dd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to get DPUDeployment %s/%s", ns, name)
+	dd.Spec.Services = services
+	err = k8sClient.Update(ctx, dd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to patch DPUDeployment services")
 }
 
 // cleanupTemplateTestResources removes DPUServiceTemplate test resources.

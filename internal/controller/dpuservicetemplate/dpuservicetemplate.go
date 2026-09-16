@@ -90,9 +90,11 @@ func NewDPUServiceTemplateManager(c client.Client, apiReader client.Reader, read
 	}
 }
 
-// EnsureTemplates creates or updates the three DPUServiceTemplate resources
-// (OVN, DTS, HBN) in the given namespace.
-func (m *DPUServiceTemplateManager) EnsureTemplates(ctx context.Context, namespace string, operatorConfig *common.OperatorConfig) error {
+// EnsureTemplates creates or updates DPUServiceTemplate resources named by
+// DPUDeployment.spec.services[].serviceTemplate. The map key identifies the
+// service (ovn / doca-telemetry-service / hbn); the ServiceTemplate value is
+// the object name.
+func (m *DPUServiceTemplateManager) EnsureTemplates(ctx context.Context, namespace string, operatorConfig *common.OperatorConfig, deployments []dpuservicev1alpha1.DPUDeployment) error {
 	log := logf.FromContext(ctx).WithValues("namespace", namespace)
 
 	log.Info("Ensuring DPUServiceTemplates")
@@ -104,27 +106,67 @@ func (m *DPUServiceTemplateManager) EnsureTemplates(ctx context.Context, namespa
 
 	dpuServiceTemplateValues.ImagePullSecret = operatorConfig.DPUServicesImagePullSecret
 
-	if err := m.ensureOVNTemplate(ctx, namespace, dpuServiceTemplateValues); err != nil {
-		return fmt.Errorf("ensuring OVN template: %w", err)
+	desiredNames := make(map[string]struct{})
+	ensureNamed := func(deploymentServiceName string, ensure func(string) error) error {
+		for _, name := range serviceTemplateNames(deployments, deploymentServiceName) {
+			desiredNames[name] = struct{}{}
+			if err := ensure(name); err != nil {
+				return fmt.Errorf("ensuring %s template %s: %w", deploymentServiceName, name, err)
+			}
+		}
+		return nil
 	}
 
-	if err := m.ensureDTSTemplate(ctx, namespace, dpuServiceTemplateValues); err != nil {
-		return fmt.Errorf("ensuring DTS template: %w", err)
+	if err := ensureNamed(templateNameOVNK, func(name string) error {
+		return m.ensureOVNTemplate(ctx, namespace, name, dpuServiceTemplateValues)
+	}); err != nil {
+		return err
+	}
+	if err := ensureNamed(templateNameDTS, func(name string) error {
+		return m.ensureDTSTemplate(ctx, namespace, name, dpuServiceTemplateValues)
+	}); err != nil {
+		return err
+	}
+	if err := ensureNamed(templateNameHBN, func(name string) error {
+		return m.ensureHBNTemplate(ctx, namespace, name, dpuServiceTemplateValues)
+	}); err != nil {
+		return err
 	}
 
-	if err := m.ensureHBNTemplate(ctx, namespace, dpuServiceTemplateValues); err != nil {
-		return fmt.Errorf("ensuring HBN template: %w", err)
+	if err := m.deleteUnreferencedTemplates(ctx, namespace, desiredNames); err != nil {
+		return err
 	}
 
 	log.Info("DPUServiceTemplate configuration complete")
 	return nil
 }
 
-// DeleteTemplates removes the three DPUServiceTemplate resources from the given namespace.
-func (m *DPUServiceTemplateManager) DeleteTemplates(ctx context.Context, namespace string) error {
-	log := logf.FromContext(ctx).WithValues("namespace", namespace)
+// serviceTemplateNames returns unique DPUServiceTemplate object names that
+// DPUDeployments request for the given deploymentServiceName (map key).
+func serviceTemplateNames(deployments []dpuservicev1alpha1.DPUDeployment, deploymentServiceName string) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	for i := range deployments {
+		svc, ok := deployments[i].Spec.Services[deploymentServiceName]
+		if !ok || svc.ServiceTemplate == "" {
+			continue
+		}
+		if _, exists := seen[svc.ServiceTemplate]; exists {
+			continue
+		}
+		seen[svc.ServiceTemplate] = struct{}{}
+		names = append(names, svc.ServiceTemplate)
+	}
+	return names
+}
 
-	log.Info("Deleting DPUServiceTemplates")
+// DeleteTemplates removes managed DPUServiceTemplate resources from the given namespace.
+func (m *DPUServiceTemplateManager) DeleteTemplates(ctx context.Context, namespace string) error {
+	return m.deleteUnreferencedTemplates(ctx, namespace, nil)
+}
+
+func (m *DPUServiceTemplateManager) deleteUnreferencedTemplates(ctx context.Context, namespace string, keep map[string]struct{}) error {
+	log := logf.FromContext(ctx).WithValues("namespace", namespace)
 
 	var list dpuservicev1alpha1.DPUServiceTemplateList
 	if err := m.client.List(ctx, &list,
@@ -135,13 +177,15 @@ func (m *DPUServiceTemplateManager) DeleteTemplates(ctx context.Context, namespa
 	}
 
 	for i := range list.Items {
+		if _, ok := keep[list.Items[i].Name]; ok {
+			continue
+		}
 		log.Info("Deleting DPUServiceTemplate", "name", list.Items[i].Name)
 		if err := m.client.Delete(ctx, &list.Items[i]); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("deleting DPUServiceTemplate %s/%s: %w", namespace, list.Items[i].Name, err)
 		}
 	}
 
-	log.Info("DPUServiceTemplate cleanup complete")
 	return nil
 }
 
@@ -394,7 +438,7 @@ func (m *DPUServiceTemplateManager) getClusterPullSecretKeychain(ctx context.Con
 	return common.KeychainFromPullSecret(ctx, m.client, clusterPullSecretName, clusterPullSecretNamespace)
 }
 
-func (m *DPUServiceTemplateManager) ensureOVNTemplate(ctx context.Context, namespace string, defaults *DPUServiceTemplateValues) error {
+func (m *DPUServiceTemplateManager) ensureOVNTemplate(ctx context.Context, namespace, name string, defaults *DPUServiceTemplateValues) error {
 	log := logf.FromContext(ctx)
 
 	managementWorkerOVNKDaemonSet, err := m.getWorkerOVNKDaemonSet(ctx)
@@ -418,7 +462,7 @@ func (m *DPUServiceTemplateManager) ensureOVNTemplate(ctx context.Context, names
 	existing := &dpuservicev1alpha1.DPUServiceTemplate{}
 	templateExists := false
 	CNOOVNKDaemonSetImageChanged := true
-	switch err := m.client.Get(ctx, client.ObjectKey{Name: templateNameOVNK, Namespace: namespace}, existing); {
+	switch err := m.client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, existing); {
 	case err == nil:
 		templateExists = true
 		lastUpdatedOVNKImage := existing.Annotations[AnnotationSourceOVNImage]
@@ -515,10 +559,10 @@ func (m *DPUServiceTemplateManager) ensureOVNTemplate(ctx context.Context, names
 		AnnotationSourceOVNImage: ovnkTemplateInfo.SourceImage,
 	}
 
-	return m.ensureTemplate(ctx, namespace, templateNameOVNK, templateNameOVNK, defaults.OVN.ChartRepoURL, defaults.OVN.ChartName, defaults.OVN.ChartVersion, values, nil, annotations, log)
+	return m.ensureTemplate(ctx, namespace, name, templateNameOVNK, defaults.OVN.ChartRepoURL, defaults.OVN.ChartName, defaults.OVN.ChartVersion, values, nil, annotations, log)
 }
 
-func (m *DPUServiceTemplateManager) ensureDTSTemplate(ctx context.Context, namespace string, defaults *DPUServiceTemplateValues) error {
+func (m *DPUServiceTemplateManager) ensureDTSTemplate(ctx context.Context, namespace, name string, defaults *DPUServiceTemplateValues) error {
 	log := logf.FromContext(ctx)
 
 	values := map[string]any{
@@ -542,10 +586,10 @@ func (m *DPUServiceTemplateManager) ensureDTSTemplate(ctx context.Context, names
 		corev1.ResourceStorage: resource.MustParse("1Gi"),
 	}
 
-	return m.ensureTemplate(ctx, namespace, templateNameDTS, templateNameDTS, defaults.DTS.ChartRepoURL, defaults.DTS.ChartName, defaults.DTS.ChartVersion, values, resourceReqs, nil, log)
+	return m.ensureTemplate(ctx, namespace, name, templateNameDTS, defaults.DTS.ChartRepoURL, defaults.DTS.ChartName, defaults.DTS.ChartVersion, values, resourceReqs, nil, log)
 }
 
-func (m *DPUServiceTemplateManager) ensureHBNTemplate(ctx context.Context, namespace string, defaults *DPUServiceTemplateValues) error {
+func (m *DPUServiceTemplateManager) ensureHBNTemplate(ctx context.Context, namespace, name string, defaults *DPUServiceTemplateValues) error {
 	log := logf.FromContext(ctx)
 
 	values := map[string]any{
@@ -564,7 +608,7 @@ func (m *DPUServiceTemplateManager) ensureHBNTemplate(ctx context.Context, names
 		}
 	}
 
-	return m.ensureTemplate(ctx, namespace, templateNameHBN, templateNameHBN, defaults.HBN.ChartRepoURL, defaults.HBN.ChartName, defaults.HBN.ChartVersion, values, nil, nil, log)
+	return m.ensureTemplate(ctx, namespace, name, templateNameHBN, defaults.HBN.ChartRepoURL, defaults.HBN.ChartName, defaults.HBN.ChartVersion, values, nil, nil, log)
 }
 
 func (m *DPUServiceTemplateManager) ensureTemplate(

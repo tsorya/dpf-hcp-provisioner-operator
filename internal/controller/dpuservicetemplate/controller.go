@@ -89,7 +89,7 @@ func (r *DPUServiceTemplateReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.Manager.EnsureTemplates(ctx, dpuClusterNS, operatorConfig); err != nil {
+	if err := r.Manager.EnsureTemplates(ctx, dpuClusterNS, operatorConfig, deployments); err != nil {
 		log.Error(err, "Failed to ensure DPUServiceTemplates")
 		return ctrl.Result{}, err
 	}

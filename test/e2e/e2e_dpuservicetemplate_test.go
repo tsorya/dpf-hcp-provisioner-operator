@@ -59,6 +59,7 @@ var _ = Describe("DPUServiceTemplate E2E", Ordered, func() {
 
 		By("creating DPUDeployment stub")
 		createDPUDeploymentStub(dpuClusterNS, dpuDeploymentName, dpuFlavorName)
+		patchDPUDeploymentServices(dpuClusterNS, dpuDeploymentName, defaultDPUServiceTemplates())
 
 		By("creating DPFOperatorConfig with version")
 		setDPFOperatorConfigVersion(stubDPFVersion)
@@ -167,8 +168,40 @@ var _ = Describe("DPUServiceTemplate E2E", Ordered, func() {
 			}, generalTemplateReconcileTimeout, generalTemplateReconcileInterval).Should(Succeed())
 		})
 
+		It("should create templates using DPUDeployment serviceTemplate names", func() {
+			ctx := context.Background()
+			customNames := []string{"e2e-ovn", "e2e-dts", "e2e-hbn"}
+
+			By("pointing DPUDeployment services at custom template names")
+			patchDPUDeploymentServices(dpuClusterNS, dpuDeploymentName, customDPUServiceTemplates())
+
+			By("waiting for templates at the custom names")
+			for _, name := range customNames {
+				Eventually(func(g Gomega) {
+					template := &dpuservicev1alpha1.DPUServiceTemplate{}
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name: name, Namespace: dpuClusterNS,
+					}, template)
+					g.Expect(err).NotTo(HaveOccurred(), "Template %s not found", name)
+					g.Expect(template.Labels[managedByLabel]).To(Equal("true"))
+				}, generalTemplateReconcileTimeout, generalTemplateReconcileInterval).Should(Succeed())
+			}
+
+			By("verifying the previous default-named templates were removed")
+			for _, name := range templateNames {
+				Eventually(func(g Gomega) {
+					template := &dpuservicev1alpha1.DPUServiceTemplate{}
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name: name, Namespace: dpuClusterNS,
+					}, template)
+					g.Expect(err).To(HaveOccurred())
+				}, generalTemplateReconcileTimeout, generalTemplateReconcileInterval).Should(Succeed())
+			}
+		})
+
 		It("should delete templates when DPUDeployment is deleted", func() {
 			ctx := context.Background()
+			customNames := []string{"e2e-ovn", "e2e-dts", "e2e-hbn"}
 
 			By("deleting the DPUDeployment while the provisioner still exists")
 			dd := &dpuservicev1alpha1.DPUDeployment{}
@@ -191,7 +224,7 @@ var _ = Describe("DPUServiceTemplate E2E", Ordered, func() {
 
 			By("verifying templates are not recreated while the provisioner still exists")
 			Consistently(func(g Gomega) {
-				for _, name := range templateNames {
+				for _, name := range customNames {
 					template := &dpuservicev1alpha1.DPUServiceTemplate{}
 					err := k8sClient.Get(ctx, types.NamespacedName{
 						Name: name, Namespace: dpuClusterNS,
@@ -206,6 +239,7 @@ var _ = Describe("DPUServiceTemplate E2E", Ordered, func() {
 
 			By("recreating DPUDeployment so templates exist again")
 			createDPUDeploymentStub(dpuClusterNS, dpuDeploymentName, dpuFlavorName)
+			patchDPUDeploymentServices(dpuClusterNS, dpuDeploymentName, defaultDPUServiceTemplates())
 
 			By("waiting for templates to be recreated")
 			for _, name := range templateNames {

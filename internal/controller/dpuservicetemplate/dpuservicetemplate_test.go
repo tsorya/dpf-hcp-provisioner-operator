@@ -189,8 +189,17 @@ func newTestDPUDeployment(name, namespace string) *dpuservicev1alpha1.DPUDeploym
 				BFB:    "bfb",
 				Flavor: "flavor",
 			},
+			Services: map[string]dpuservicev1alpha1.DPUDeploymentServiceConfiguration{
+				"ovn":                    {ServiceTemplate: "ovn", ServiceConfiguration: "ovn"},
+				"doca-telemetry-service": {ServiceTemplate: "doca-telemetry-service", ServiceConfiguration: "dts"},
+				"hbn":                    {ServiceTemplate: "hbn", ServiceConfiguration: "hbn"},
+			},
 		},
 	}
+}
+
+func defaultTemplateDeployments() []dpuservicev1alpha1.DPUDeployment {
+	return []dpuservicev1alpha1.DPUDeployment{*newTestDPUDeployment("hcp-dpu-deployment", "dpf-operator-system")}
 }
 
 func newDeletingDPUDeployment(name, namespace string) *dpuservicev1alpha1.DPUDeployment {
@@ -250,7 +259,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 
 				// Verify OVN template
@@ -301,6 +310,71 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 			})
 		})
 
+		Context("when DPUDeployment specifies template object names", func() {
+			It("should create templates with the names from DPUDeployment.spec.services", func() {
+				prereqs := allPrereqs(x86OVNImage)
+
+				fakeClient = fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithObjects(prereqs...).
+					WithStatusSubresource(prereqs[0]).
+					Build()
+
+				reader := &fakeReleaseImageReader{image: arm64OVNImage}
+				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
+
+				dd := newTestDPUDeployment("hcp-dpu-deployment", targetNamespace)
+				dd.Spec.Services["ovn"] = dpuservicev1alpha1.DPUDeploymentServiceConfiguration{ServiceTemplate: "my-ovn"}
+				dd.Spec.Services["hbn"] = dpuservicev1alpha1.DPUDeploymentServiceConfiguration{ServiceTemplate: "my-hbn"}
+
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, []dpuservicev1alpha1.DPUDeployment{*dd})
+				Expect(err).NotTo(HaveOccurred())
+
+				ovnTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
+				err = fakeClient.Get(ctx, types.NamespacedName{Name: "my-ovn", Namespace: targetNamespace}, ovnTemplate)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(ovnTemplate.Spec.DeploymentServiceName).To(Equal("ovn"))
+
+				hbnTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
+				err = fakeClient.Get(ctx, types.NamespacedName{Name: "my-hbn", Namespace: targetNamespace}, hbnTemplate)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(hbnTemplate.Spec.DeploymentServiceName).To(Equal("hbn"))
+
+				missing := &dpuservicev1alpha1.DPUServiceTemplate{}
+				err = fakeClient.Get(ctx, types.NamespacedName{Name: "ovn", Namespace: targetNamespace}, missing)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			})
+
+			It("should delete managed templates that DPUDeployment no longer references", func() {
+				prereqs := allPrereqs(x86OVNImage)
+				stale := newManagedTemplate("ovn", targetNamespace)
+				objects := append(prereqs, stale)
+
+				fakeClient = fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithObjects(objects...).
+					WithStatusSubresource(prereqs[0]).
+					Build()
+
+				reader := &fakeReleaseImageReader{image: arm64OVNImage}
+				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
+
+				dd := newTestDPUDeployment("hcp-dpu-deployment", targetNamespace)
+				dd.Spec.Services["ovn"] = dpuservicev1alpha1.DPUDeploymentServiceConfiguration{ServiceTemplate: "my-ovn"}
+
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, []dpuservicev1alpha1.DPUDeployment{*dd})
+				Expect(err).NotTo(HaveOccurred())
+
+				staleTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
+				err = fakeClient.Get(ctx, types.NamespacedName{Name: "ovn", Namespace: targetNamespace}, staleTemplate)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+				ovnTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
+				err = fakeClient.Get(ctx, types.NamespacedName{Name: "my-ovn", Namespace: targetNamespace}, ovnTemplate)
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
 		Context("when OVN DaemonSet image has not changed", func() {
 			It("should skip the release payload pull", func() {
 				prereqs := allPrereqs(x86OVNImage)
@@ -315,12 +389,12 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
 				// First call resolves from release payload
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 				Expect(reader.callCount).To(Equal(1))
 
 				// Second call should skip the pull (annotation matches DaemonSet image)
-				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 				Expect(reader.callCount).To(Equal(1))
 			})
@@ -338,7 +412,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
 				// First call creates templates with OCP 4.19.0-ec.5 → daemonset version 1.3.0
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 
 				ovnTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
@@ -358,7 +432,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Reconcile again — image unchanged, daemonset version should NOT advance
-				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 
 				err = fakeClient.Get(ctx, types.NamespacedName{Name: "ovn", Namespace: targetNamespace}, ovnTemplate)
@@ -391,7 +465,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 
 				ovnTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
@@ -415,7 +489,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
 				// First call creates templates
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 				Expect(reader.callCount).To(Equal(1))
 
@@ -434,7 +508,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Second call should detect image change but skip pull due to incomplete rollout
-				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 				Expect(reader.callCount).To(Equal(1))
 
@@ -470,7 +544,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
 				// First call creates templates
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 				Expect(reader.callCount).To(Equal(1))
 
@@ -491,7 +565,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader.image = newArm64Image
 
 				// Second call should resolve the new aarch64 image
-				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err = manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 				Expect(reader.callCount).To(Equal(2))
 
@@ -529,7 +603,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 
 				// Release payload should never be consulted
@@ -566,7 +640,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).To(HaveOccurred())
 			})
 		})
@@ -589,7 +663,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).To(HaveOccurred())
 			})
 		})
@@ -611,7 +685,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).To(HaveOccurred())
 			})
 		})
@@ -631,7 +705,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("resolving OVN kubernetes image"))
 			})
@@ -668,7 +742,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 
 				ovnTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
@@ -713,7 +787,7 @@ var _ = Describe("DPUServiceTemplate Manager", func() {
 				reader := &fakeReleaseImageReader{image: arm64OVNImage}
 				manager = dpuservicetemplate.NewDPUServiceTemplateManager(fakeClient, fakeClient, reader, testOperatorNamespace)
 
-				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{})
+				err := manager.EnsureTemplates(ctx, targetNamespace, &common.OperatorConfig{}, defaultTemplateDeployments())
 				Expect(err).NotTo(HaveOccurred())
 
 				ovnTemplate := &dpuservicev1alpha1.DPUServiceTemplate{}
